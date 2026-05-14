@@ -377,6 +377,8 @@ option() = {name, atom()} |
            {tcp_opts, [gen_tcp:option()]} |
            {ssl, boolean()} |
            {ssl_opts, [ssl:tls_client_option()]} |
+           {proxy, #{host := host(), port := inet:port_number(),
+                     username => iodata(), password => iodata()}} |
            {quic_opts, {quicer:conn_opts(), quicer:stream_opts()}} |
            {ws_path, string()} |
            {connect_timeout, pos_integer()} |
@@ -551,6 +553,31 @@ Enable SSL/TLS transport or not. Defaults to false.
 `{ssl_opts, Options}`
 
 Additional options for `ssl:connect/3`.
+
+`{proxy, ProxyOpts}`
+
+Connect to the MQTT server through an HTTP `CONNECT` proxy. `ProxyOpts` is a
+map with the following keys:
+
+- `host` (required): proxy hostname or IP address
+- `port` (required): proxy port
+- `username` (optional): Basic auth username
+- `password` (optional): Basic auth password (accepts `emqtt_secret:t(iodata())`)
+
+When `ssl` is also enabled, the TLS handshake is performed end-to-end with the
+target MQTT broker after the proxy tunnel is established (TLS is **not**
+terminated at the proxy). Currently only supported for TCP and TLS transports.
+
+Example:
+
+```erlang
+emqtt:start_link([
+    {host, "mqtt.example.com"}, {port, 8883}, {ssl, true},
+    {ssl_opts, [{verify, verify_peer}, {server_name_indication, "mqtt.example.com"}]},
+    {proxy, #{host => "proxy.internal", port => 3128,
+              username => <<"alice">>, password => <<"s3cret">>}}
+]).
+```
 
 `{ws_path, Path}`
 

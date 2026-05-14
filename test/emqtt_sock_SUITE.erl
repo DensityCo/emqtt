@@ -177,6 +177,139 @@ t_tcp_sock(_) ->
     ok = emqtt_sock:close(Sock),
     ok = tcp_server:stop(Server).
 
+t_http_proxy_tunnel(_) ->
+    BackendPort = 14001,
+    Backend = tcp_server:start_link(BackendPort),
+    ProxyPort = 14080,
+    Proxy = start_http_proxy(ProxyPort,
+                fun(_Host, _Port) -> {forward, "127.0.0.1", BackendPort} end),
+    ProxyOpts = #{host => "127.0.0.1", port => ProxyPort},
+    {ok, Sock} = emqtt_sock:connect("backend.example.com", BackendPort,
+                                    [{proxy, ProxyOpts}], 3000),
+    ok = emqtt_sock:send(Sock, <<"hi">>),
+    {ok, <<"hi">>} = emqtt_sock:recv(Sock, 0),
+    ok = emqtt_sock:close(Sock),
+    stop_http_proxy(Proxy),
+    ok = tcp_server:stop(Backend).
+
+t_http_proxy_auth(_) ->
+    BackendPort = 14002,
+    Backend = tcp_server:start_link(BackendPort),
+    ProxyPort = 14081,
+    ExpectedAuth = <<"Basic ", (base64:encode(<<"u:p">>))/binary>>,
+    Proxy = start_http_proxy(ProxyPort,
+                fun(_, _) -> {forward_if_auth, ExpectedAuth, "127.0.0.1", BackendPort} end),
+    ProxyOpts = #{host => <<"127.0.0.1">>, port => ProxyPort,
+                  username => <<"u">>, password => <<"p">>},
+    {ok, Sock} = emqtt_sock:connect("backend.example.com", BackendPort,
+                                    [{proxy, ProxyOpts}], 3000),
+    ok = emqtt_sock:send(Sock, <<"hello">>),
+    {ok, <<"hello">>} = emqtt_sock:recv(Sock, 0),
+    ok = emqtt_sock:close(Sock),
+    stop_http_proxy(Proxy),
+    ok = tcp_server:stop(Backend).
+
+t_http_proxy_rejected(_) ->
+    ProxyPort = 14082,
+    Proxy = start_http_proxy(ProxyPort, fun(_, _) -> reject end),
+    ProxyOpts = #{host => "127.0.0.1", port => ProxyPort},
+    Res = emqtt_sock:connect("backend.example.com", 1883,
+                             [{proxy, ProxyOpts}], 3000),
+    ?assertMatch({error, {proxy_error, {proxy_status, 407, _}}}, Res),
+    stop_http_proxy(Proxy).
+
+t_http_proxy_unreachable(_) ->
+    ProxyOpts = #{host => "127.0.0.1", port => 1},
+    Res = emqtt_sock:connect("backend.example.com", 1883,
+                             [{proxy, ProxyOpts}], 1000),
+    ?assertMatch({error, {proxy_connect_error, _}}, Res).
+
+%% Minimal HTTP CONNECT proxy for tests
+start_http_proxy(Port, Handler) ->
+    Parent = self(),
+    Pid = spawn_link(fun() ->
+                {ok, LSock} = gen_tcp:listen(Port, [binary, {active, false},
+                                                    {reuseaddr, true}, {packet, http_bin}]),
+                Parent ! {self(), ready},
+                proxy_loop(LSock, Handler)
+        end),
+    receive {Pid, ready} -> Pid after 2000 -> error(proxy_not_ready) end.
+
+stop_http_proxy(Pid) ->
+    unlink(Pid),
+    exit(Pid, kill),
+    ok.
+
+proxy_loop(LSock, Handler) ->
+    case gen_tcp:accept(LSock) of
+        {ok, Sock} ->
+            Pid = spawn(fun() ->
+                receive go -> handle_proxy_conn(Sock, Handler) end
+            end),
+            ok = gen_tcp:controlling_process(Sock, Pid),
+            Pid ! go,
+            proxy_loop(LSock, Handler);
+        _ -> ok
+    end.
+
+handle_proxy_conn(Sock, Handler) ->
+    case gen_tcp:recv(Sock, 0, 5000) of
+        {ok, {http_request, M, {scheme, HostBin, PortBin}, _}}
+          when M =:= 'CONNECT'; M =:= <<"CONNECT">> ->
+            Host = unicode:characters_to_list(HostBin),
+            Port = list_to_integer(unicode:characters_to_list(PortBin)),
+            Headers = collect_headers(Sock, []),
+            handle_decision(Sock, Handler(Host, Port), Headers);
+        _ ->
+            gen_tcp:close(Sock)
+    end.
+
+collect_headers(Sock, Acc) ->
+    case gen_tcp:recv(Sock, 0, 5000) of
+        {ok, http_eoh} -> lists:reverse(Acc);
+        {ok, {http_header, _, Name, _, Value}} -> collect_headers(Sock, [{Name, Value} | Acc]);
+        _ -> lists:reverse(Acc)
+    end.
+
+handle_decision(Sock, {forward, BHost, BPort}, _Headers) ->
+    forward(Sock, BHost, BPort);
+handle_decision(Sock, {forward_if_auth, Expected, BHost, BPort}, Headers) ->
+    case lists:keyfind('Proxy-Authorization', 1, Headers) of
+        {_, Expected} -> forward(Sock, BHost, BPort);
+        _ -> reject(Sock)
+    end;
+handle_decision(Sock, reject, _Headers) ->
+    reject(Sock).
+
+reject(Sock) ->
+    ok = inet:setopts(Sock, [{packet, raw}]),
+    gen_tcp:send(Sock, <<"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n">>),
+    gen_tcp:close(Sock).
+
+forward(Sock, BHost, BPort) ->
+    ok = inet:setopts(Sock, [{packet, raw}]),
+    case gen_tcp:connect(BHost, BPort, [binary, {active, false}, {packet, raw}], 3000) of
+        {ok, Backend} ->
+            gen_tcp:send(Sock, <<"HTTP/1.1 200 Connection established\r\n\r\n">>),
+            relay(Sock, Backend);
+        _ ->
+            gen_tcp:send(Sock, <<"HTTP/1.1 502 Bad Gateway\r\n\r\n">>),
+            gen_tcp:close(Sock)
+    end.
+
+relay(A, B) ->
+    inet:setopts(A, [{active, true}]),
+    inet:setopts(B, [{active, true}]),
+    relay_loop(A, B).
+
+relay_loop(A, B) ->
+    receive
+        {tcp, A, Data} -> gen_tcp:send(B, Data), relay_loop(A, B);
+        {tcp, B, Data} -> gen_tcp:send(A, Data), relay_loop(A, B);
+        {tcp_closed, _} -> gen_tcp:close(A), gen_tcp:close(B);
+        _ -> relay_loop(A, B)
+    end.
+
 t_ssl_sock(Config) ->
     SslOpts = [{certfile, certfile(Config)},
                {keyfile, keyfile(Config)},

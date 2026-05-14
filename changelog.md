@@ -1,5 +1,9 @@
 # 1.15.0
 
+- Add `{proxy, ProxyOpts}` option for HTTP `CONNECT` tunneling. When set, the
+  client connects to the proxy host/port, issues `CONNECT target:port`,
+  optionally with Basic auth, and then proceeds with the normal MQTT (and TLS)
+  handshake over the tunnel.
 - Build packages on OTP 27 and OTP 28.
 - Drop OTP < 26 from the build matrix; raise `minimum_otp_vsn` to 26.0.
 - Relax `cowlib` and `gun` version pins to `~> 2.13` and `~> 2.1` so

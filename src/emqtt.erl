@@ -150,6 +150,7 @@
                 | {tcp_opts, [gen_tcp:option()]}
                 | {ssl, boolean()}
                 | {ssl_opts, [ssl:tls_client_option()]}
+                | {proxy, emqtt_sock:proxy_opts()}
                 | {quic_opts, {_, _}}
                 | {ws_path, string()}
                 | {connect_timeout, pos_integer()}
@@ -810,6 +811,8 @@ init([{hosts, Hosts} | Opts], State) ->
     init(Opts, State#state{hosts = Hosts1});
 init([{tcp_opts, TcpOpts} | Opts], State = #state{sock_opts = SockOpts}) ->
     init(Opts, State#state{sock_opts = merge_opts(SockOpts, TcpOpts)});
+init([{proxy, ProxyOpts} | Opts], State = #state{sock_opts = SockOpts}) when is_map(ProxyOpts) ->
+    init(Opts, State#state{sock_opts = merge_opts(SockOpts, [{proxy, ProxyOpts}])});
 init([{quic_opts, {_ConnOpts, _StreamOpts}} = QuicOpts | Opts], State = #state{sock_opts = SockOpts}) ->
     init(Opts, State#state{sock_opts = merge_opts(SockOpts, [QuicOpts])});
 init([{ssl, EnableSsl} | Opts], State) ->

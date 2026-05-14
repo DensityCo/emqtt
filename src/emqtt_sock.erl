@@ -33,9 +33,16 @@
 
 -type(sockname() :: {inet:ip_address(), inet:port_number()}).
 
--type(option() :: gen_tcp:connect_option() | {ssl_opts, [ssl:tls_client_option()]}).
+-type(proxy_opts() :: #{host := inet:ip_address() | inet:hostname() | binary(),
+                        port := inet:port_number(),
+                        username => iodata() | emqtt_secret:t(iodata()),
+                        password => iodata() | emqtt_secret:t(iodata())}).
 
--export_type([socket/0, option/0]).
+-type(option() :: gen_tcp:connect_option()
+                | {ssl_opts, [ssl:tls_client_option()]}
+                | {proxy, proxy_opts()}).
+
+-export_type([socket/0, option/0, proxy_opts/0]).
 
 -define(DEFAULT_TCP_OPTIONS, [binary, {packet, raw}, {active, false},
                               {nodelay, true}]).
@@ -45,8 +52,10 @@
       -> {ok, socket()} | {error, term()}).
 connect(Host, Port, SockOpts, Timeout) ->
     TcpOpts = merge_opts(?DEFAULT_TCP_OPTIONS,
-                         lists:keydelete(ssl_opts, 1, SockOpts)),
-    case gen_tcp:connect(Host, Port, TcpOpts, Timeout) of
+                         lists:keydelete(proxy, 1,
+                             lists:keydelete(ssl_opts, 1, SockOpts))),
+    ProxyOpts = proplists:get_value(proxy, SockOpts, undefined),
+    case tcp_connect(Host, Port, TcpOpts, ProxyOpts, Timeout) of
         {ok, Sock} ->
             case lists:keyfind(ssl_opts, 1, SockOpts) of
                 {ssl_opts, SslOpts} ->
@@ -54,6 +63,95 @@ connect(Host, Port, SockOpts, Timeout) ->
                     ssl_upgrade(Host, Sock, SslOpts, Timeout);
                 false -> {ok, Sock}
             end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+tcp_connect(Host, Port, TcpOpts, undefined, Timeout) ->
+    gen_tcp:connect(Host, Port, TcpOpts, Timeout);
+tcp_connect(Host, Port, TcpOpts, ProxyOpts, Timeout) ->
+    ProxyHost = host_to_connect_arg(maps:get(host, ProxyOpts)),
+    ProxyPort = maps:get(port, ProxyOpts),
+    Deadline = deadline(Timeout),
+    case gen_tcp:connect(ProxyHost, ProxyPort, TcpOpts, time_left(Deadline)) of
+        {ok, Sock} ->
+            case http_connect_tunnel(Sock, Host, Port, ProxyOpts, time_left(Deadline)) of
+                ok ->
+                    {ok, Sock};
+                {error, Reason} ->
+                    _ = gen_tcp:close(Sock),
+                    {error, {proxy_error, Reason}}
+            end;
+        {error, Reason} ->
+            {error, {proxy_connect_error, Reason}}
+    end.
+
+host_to_connect_arg(H) when is_binary(H) -> binary_to_list(H);
+host_to_connect_arg(H) -> H.
+
+deadline(infinity) -> infinity;
+deadline(Timeout) when is_integer(Timeout) ->
+    erlang:monotonic_time(millisecond) + Timeout.
+
+time_left(infinity) -> infinity;
+time_left(Deadline) ->
+    max(0, Deadline - erlang:monotonic_time(millisecond)).
+
+http_connect_tunnel(Sock, Host, Port, ProxyOpts, Timeout) ->
+    Request = build_connect_request(Host, Port, ProxyOpts),
+    case gen_tcp:send(Sock, Request) of
+        ok ->
+            recv_connect_response(Sock, Timeout);
+        {error, Reason} ->
+            {error, {send_failed, Reason}}
+    end.
+
+build_connect_request(Host, Port, ProxyOpts) ->
+    HostPort = iolist_to_binary(io_lib:format("~s:~B", [format_host(Host), Port])),
+    [<<"CONNECT ">>, HostPort, <<" HTTP/1.1\r\n">>,
+     <<"Host: ">>, HostPort, <<"\r\n">>,
+     proxy_auth_header(ProxyOpts),
+     <<"\r\n">>].
+
+format_host(Ip) when is_tuple(Ip) -> inet:ntoa(Ip);
+format_host(H) when is_binary(H) -> H;
+format_host(H) -> H.
+
+proxy_auth_header(#{username := User} = ProxyOpts) when User =/= undefined ->
+    Pass = maps:get(password, ProxyOpts, <<>>),
+    Creds = iolist_to_binary([unwrap(User), $:, unwrap(Pass)]),
+    Encoded = base64:encode(Creds),
+    [<<"Proxy-Authorization: Basic ">>, Encoded, <<"\r\n">>];
+proxy_auth_header(_) ->
+    [].
+
+unwrap(V) when is_function(V, 0) -> emqtt_secret:unwrap(V);
+unwrap(V) -> V.
+
+recv_connect_response(Sock, Timeout) ->
+    ok = inet:setopts(Sock, [{packet, http_bin}]),
+    Result =
+        case gen_tcp:recv(Sock, 0, Timeout) of
+            {ok, {http_response, _Version, 200, _Reason}} ->
+                consume_http_headers(Sock, Timeout);
+            {ok, {http_response, _Version, Status, Reason}} ->
+                {error, {proxy_status, Status, Reason}};
+            {ok, {http_error, Line}} ->
+                {error, {http_error, Line}};
+            {error, Reason} ->
+                {error, Reason}
+        end,
+    _ = inet:setopts(Sock, [{packet, raw}]),
+    Result.
+
+consume_http_headers(Sock, Timeout) ->
+    case gen_tcp:recv(Sock, 0, Timeout) of
+        {ok, http_eoh} ->
+            ok;
+        {ok, {http_header, _, _, _, _}} ->
+            consume_http_headers(Sock, Timeout);
+        {ok, {http_error, Line}} ->
+            {error, {http_error, Line}};
         {error, Reason} ->
             {error, Reason}
     end.
